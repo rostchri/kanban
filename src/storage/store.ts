@@ -1,4 +1,4 @@
-import { promises as fs, existsSync, mkdirSync, watch as fsWatch } from "fs";
+import { promises as fs, existsSync, mkdirSync } from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "child_process";
@@ -16,6 +16,8 @@ export interface StoreChangeEvent {
   /** What kind of mutation happened. */
   type: 'created' | 'updated' | 'moved' | 'deleted';
   taskId: string;
+  /** Full task object for created/updated/moved events. Absent for deleted. */
+  task?: Task;
   tags: string[];
   status: TaskStatus | null;
   /** Session the task belongs to. */
@@ -586,6 +588,7 @@ export async function createTask(
   emitChange({
     type: 'created',
     taskId: task.id,
+    task,
     tags: task.tags,
     status: task.status,
     session: targetSession,
@@ -623,6 +626,7 @@ export async function updateTask(
   emitChange({
     type: eventType,
     taskId: task.id,
+    task,
     tags: task.tags,
     status: task.status,
     session: targetSession,
@@ -684,6 +688,7 @@ export async function appendNote(
   emitChange({
     type: 'updated',
     taskId: task.id,
+    task,
     tags: task.tags,
     status: task.status,
     session: targetSession,
@@ -1027,6 +1032,35 @@ interface TaskSnapshot {
 /** In-memory snapshot: sessionName → Map<taskId, TaskSnapshot> */
 const _watchSnapshot = new Map<string, Map<string, TaskSnapshot>>();
 
+/** Last observed mtime (ms) per session name, used to detect file changes. */
+const _pollMtimes = new Map<string, number>();
+
+// ---------------------------------------------------------------------------
+// Test-support hooks (tree-shaken in production builds via lack of callers).
+// Allows unit tests to inject a temporary sessions directory without touching
+// the real ~/.kanban/sessions path.
+// ---------------------------------------------------------------------------
+
+/** Effective sessions directory used by all poll/watch functions. */
+let _sessionsDir: string = SESSIONS_DIR;
+
+/** @internal Allow tests to inject a temporary sessions directory. */
+export function _testOverrideSessionsDir(dir: string): void {
+  _sessionsDir = dir;
+}
+
+/** @internal Reset all poll-related state between tests. */
+export function _testResetPollState(): void {
+  _watchSnapshot.clear();
+  _pollMtimes.clear();
+  _sessionsDir = SESSIONS_DIR;
+}
+
+/** Resolve the tasks.json path for a session in the current _sessionsDir. */
+function _sessionDataFile(session: string): string {
+  return path.join(_sessionsDir, session, 'tasks.json');
+}
+
 function _taskToSnapshot(task: Task): TaskSnapshot {
   return {
     id: task.id,
@@ -1065,6 +1099,7 @@ function _diffAndEmit(session: string, tasks: Task[]): void {
       emitChange({
         type: 'created',
         taskId: id,
+        task,
         tags: task.tags,
         status: snap.status,
         session,
@@ -1107,6 +1142,7 @@ function _diffAndEmit(session: string, tasks: Task[]): void {
     emitChange({
       type: eventType,
       taskId: id,
+      task,
       tags: task.tags,
       status: snap.status,
       session,
@@ -1119,15 +1155,15 @@ function _diffAndEmit(session: string, tasks: Task[]): void {
 }
 
 /**
- * Load the initial snapshot for all existing sessions so the first fs.watch
- * event doesn't produce spurious 'created' events for pre-existing tasks.
+ * Load the initial snapshot for all existing sessions so the first poll tick
+ * doesn't produce spurious 'created' events for pre-existing tasks.
  */
 async function _initWatchSnapshot(): Promise<void> {
-  if (!existsSync(SESSIONS_DIR)) return;
+  if (!existsSync(_sessionsDir)) return;
 
   let entries: string[];
   try {
-    const dirEntries = await fs.readdir(SESSIONS_DIR, { withFileTypes: true });
+    const dirEntries = await fs.readdir(_sessionsDir, { withFileTypes: true });
     entries = dirEntries.filter((e) => e.isDirectory()).map((e) => e.name);
   } catch {
     return;
@@ -1135,7 +1171,7 @@ async function _initWatchSnapshot(): Promise<void> {
 
   await Promise.all(
     entries.map(async (session) => {
-      const dataFile = getSessionDataFile(session);
+      const dataFile = _sessionDataFile(session);
       try {
         const raw = await fs.readFile(dataFile, 'utf-8');
         const data: TaskFlowData = JSON.parse(raw);
@@ -1149,90 +1185,118 @@ async function _initWatchSnapshot(): Promise<void> {
 }
 
 /**
- * Start watching the sessions directory for cross-process mutations.
+ * Start polling the sessions directory for cross-process mutations.
  *
  * Call this ONCE in the HTTP-server process (startDashboardServer).
  * The MCP-server process does NOT need this watcher — it emits in-process.
  *
  * Mechanism:
- *  - `fs.watch` with `{ recursive: true }` fires whenever any file under
- *    SESSIONS_DIR is changed.
- *  - We debounce (150 ms) because fs.watch can fire multiple events for a
- *    single logical write (rename + write, or inotify coalescing).
- *  - On each debounce expiry we determine which session(s) changed from the
- *    filename hint, re-read their tasks.json, diff against the in-memory
- *    snapshot, and emit `storeEvents` change events.
- *  - JSON parse errors are caught and skipped — a partial write is retried
- *    on the next fs event automatically.
+ *  - A `setInterval` tick runs every POLL_INTERVAL_MS (1000 ms).
+ *  - Each tick scans _sessionsDir via `fs.promises.readdir`, then checks the
+ *    mtime of each session's `tasks.json` via `fs.promises.stat`.
+ *  - When a mtime has changed since the last recorded value the file is
+ *    re-read and diffed against the in-memory snapshot; per-task
+ *    `storeEvents` change events are emitted for each detected mutation.
+ *  - JSON parse errors from partial/atomic writes are caught and skipped —
+ *    the next poll tick will retry automatically.
+ *  - The interval is unref()d so it does not prevent process exit.
  *
- * NOTE: `fs.watch` with `recursive: true` works on Linux when the underlying
- * kernel supports inotify (which it does on any modern Linux kernel ≥ 2.6.36).
- * Alpine Linux in Docker ships a kernel that supports this.
+ * Why polling instead of fs.watch:
+ *  - `fs.watch({ recursive: true })` is unreliable on Linux (Docker volume +
+ *    atomic-rename writes) — it stops firing after a period of uptime without
+ *    a process restart, causing SSE to go silent permanently.
+ *  - A 1 s poll interval is imperceptible for a Kanban UI and introduces
+ *    negligible I/O (only stat() calls unless mtime changed).
  */
-export async function watchStore(): Promise<void> {
-  ensureDir(SESSIONS_DIR);
 
-  // Populate initial snapshot before watching to avoid false 'created' events.
+/** Poll interval in milliseconds. */
+const POLL_INTERVAL_MS = 1000;
+
+/**
+ * Single poll tick: scan all session directories, check mtimes, diff + emit.
+ */
+async function _pollTick(): Promise<void> {
+  if (!existsSync(_sessionsDir)) return;
+
+  let sessionNames: string[];
+  try {
+    const entries = await fs.readdir(_sessionsDir, { withFileTypes: true });
+    sessionNames = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    return; // _sessionsDir temporarily unreadable — skip this tick
+  }
+
+  await Promise.all(
+    sessionNames.map(async (session) => {
+      const dataFile = _sessionDataFile(session);
+      let mtime: number;
+      try {
+        const stat = await fs.stat(dataFile);
+        mtime = stat.mtimeMs;
+      } catch {
+        // tasks.json doesn't exist yet for this session — skip
+        return;
+      }
+
+      const prevMtime = _pollMtimes.get(session);
+      if (prevMtime === mtime) return; // nothing changed
+
+      // mtime changed (or first observation) — record and diff
+      _pollMtimes.set(session, mtime);
+
+      // Skip diff on first observation to avoid phantom 'created' events for
+      // tasks that were already in the snapshot built by _initWatchSnapshot.
+      if (prevMtime === undefined) return;
+
+      try {
+        const raw = await fs.readFile(dataFile, 'utf-8');
+        const data: TaskFlowData = JSON.parse(raw);
+        _diffAndEmit(session, data.tasks ?? []);
+      } catch {
+        // Partial/atomic write in progress — skip; next tick will retry.
+      }
+    }),
+  );
+}
+
+export async function watchStore(): Promise<void> {
+  ensureDir(_sessionsDir);
+
+  // Populate initial snapshot before polling to avoid false 'created' events.
   await _initWatchSnapshot();
 
-  // Pending debounce timers per session name (or '*' for global re-scan)
-  const pending = new Map<string, ReturnType<typeof setTimeout>>();
-
-  /**
-   * Re-read and diff one session's tasks file, then update the snapshot.
-   */
-  async function processSession(session: string): Promise<void> {
-    const dataFile = getSessionDataFile(session);
+  // Seed mtimes from disk so the very first poll tick has a baseline and does
+  // not re-emit events for files that already existed at startup.
+  if (existsSync(_sessionsDir)) {
     try {
-      const raw = await fs.readFile(dataFile, 'utf-8');
-      const data: TaskFlowData = JSON.parse(raw);
-      _diffAndEmit(session, data.tasks ?? []);
+      const entries = await fs.readdir(_sessionsDir, { withFileTypes: true });
+      await Promise.all(
+        entries
+          .filter((e) => e.isDirectory())
+          .map(async (e) => {
+            const dataFile = _sessionDataFile(e.name);
+            try {
+              const stat = await fs.stat(dataFile);
+              _pollMtimes.set(e.name, stat.mtimeMs);
+            } catch {
+              // no tasks.json yet — will be picked up once it appears
+            }
+          }),
+      );
     } catch {
-      // Partial write or non-existent file — skip; will retry on next event.
+      // best-effort
     }
   }
 
-  /**
-   * Schedule a debounced re-read for the given session.
-   */
-  function schedule(session: string): void {
-    const existing = pending.get(session);
-    if (existing !== undefined) clearTimeout(existing);
+  const interval = setInterval(() => {
+    _pollTick().catch(() => {
+      // _pollTick is best-effort; ignore errors to keep the interval alive
+    });
+  }, POLL_INTERVAL_MS);
 
-    pending.set(
-      session,
-      setTimeout(() => {
-        pending.delete(session);
-        processSession(session).catch(() => {
-          // processSession is best-effort; ignore errors in the watcher
-        });
-      }, 150),
-    );
-  }
-
-  const watcher = fsWatch(
-    SESSIONS_DIR,
-    { recursive: true, persistent: false },
-    (eventType, filename) => {
-      if (!filename) return;
-
-      // filename looks like "independent/tasks.json" or "tasks.json" depending
-      // on the OS.  We want the first path segment as session name.
-      const parts = filename.split(path.sep);
-      const session = parts[0];
-
-      // Only react to tasks.json changes (ignore .tmp files and other files)
-      const basename = parts[parts.length - 1];
-      if (!basename || (!basename.endsWith('tasks.json') && basename !== 'tasks.json')) return;
-
-      schedule(session);
-    },
-  );
-
-  // Do not let this watcher keep the event-loop alive artificially —
-  // `persistent: false` already handles that (watcher won't prevent exit).
-  // We also set unref() as a belt-and-suspenders measure.
-  watcher.unref();
+  // Prevent the interval from keeping the process alive after all other work
+  // is done (e.g., during graceful shutdown).
+  interval.unref();
 }
 
 // Legacy init (creates dirs if needed)
