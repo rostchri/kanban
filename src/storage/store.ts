@@ -2,7 +2,40 @@ import { promises as fs, existsSync, mkdirSync } from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "child_process";
+import { EventEmitter } from "events";
 import type { Task, TaskFlowData, TaskStatus, SessionInfo } from "../types.js";
+
+// ---------------------------------------------------------------------------
+// Store-level EventEmitter — emits a 'change' event on every mutation.
+// Both the MCP server and the HTTP server share this same module instance,
+// so a single emit point here covers all write paths.
+// ---------------------------------------------------------------------------
+
+/** Payload emitted with every 'change' event. */
+export interface StoreChangeEvent {
+  /** What kind of mutation happened. */
+  type: 'created' | 'updated' | 'moved' | 'deleted';
+  taskId: string;
+  tags: string[];
+  status: TaskStatus | null;
+  /** Session the task belongs to. */
+  session: string;
+  /** Unix epoch milliseconds. */
+  ts: number;
+}
+
+class StoreEventEmitter extends EventEmitter {}
+
+/** Singleton emitter.  Subscribe with: storeEvents.on('change', handler) */
+export const storeEvents: StoreEventEmitter = new StoreEventEmitter();
+
+// Prevent the default Node.js MaxListenersExceededWarning from firing when
+// many SSE clients connect — each adds one 'change' listener.
+storeEvents.setMaxListeners(0);
+
+function emitChange(event: StoreChangeEvent): void {
+  storeEvents.emit('change', event);
+}
 
 const KANBAN_DIR = path.join(os.homedir(), ".kanban");
 const SESSIONS_DIR = path.join(KANBAN_DIR, "sessions");
@@ -550,6 +583,14 @@ export async function createTask(
 
   data.tasks.push(task);
   await writeSessionData(targetSession, data);
+  emitChange({
+    type: 'created',
+    taskId: task.id,
+    tags: task.tags,
+    status: task.status,
+    session: targetSession,
+    ts: Date.now(),
+  });
   return task;
 }
 
@@ -564,6 +605,7 @@ export async function updateTask(
   if (idx === -1) return undefined;
 
   const task = data.tasks[idx];
+  const prevStatus = task.status;
   if (input.title !== undefined) task.title = input.title;
   if (input.description !== undefined) task.description = input.description;
   if (input.status !== undefined) task.status = input.status;
@@ -571,6 +613,22 @@ export async function updateTask(
   task.updatedAt = new Date().toISOString();
 
   await writeSessionData(targetSession, data);
+
+  // Determine event type: 'moved' when only the status changed, 'updated' otherwise.
+  const eventType =
+    input.status !== undefined && input.status !== prevStatus &&
+    input.title === undefined && input.description === undefined && input.tags === undefined
+      ? 'moved'
+      : 'updated';
+  emitChange({
+    type: eventType,
+    taskId: task.id,
+    tags: task.tags,
+    status: task.status,
+    session: targetSession,
+    ts: Date.now(),
+  });
+
   return task;
 }
 
@@ -589,9 +647,18 @@ export async function deleteTask(
   const targetSession = sessionName ?? (await getCurrentSessionName());
   const data = await readSessionData(targetSession);
   const initialLen = data.tasks.length;
+  const deletedTask = data.tasks.find((t) => t.id === id);
   data.tasks = data.tasks.filter((t) => t.id !== id);
   if (data.tasks.length === initialLen) return false;
   await writeSessionData(targetSession, data);
+  emitChange({
+    type: 'deleted',
+    taskId: id,
+    tags: deletedTask?.tags ?? [],
+    status: deletedTask?.status ?? null,
+    session: targetSession,
+    ts: Date.now(),
+  });
   return true;
 }
 
@@ -614,6 +681,14 @@ export async function appendNote(
   task.updatedAt = timestamp;
 
   await writeSessionData(targetSession, data);
+  emitChange({
+    type: 'updated',
+    taskId: task.id,
+    tags: task.tags,
+    status: task.status,
+    session: targetSession,
+    ts: Date.now(),
+  });
   return task;
 }
 

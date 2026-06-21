@@ -1,14 +1,114 @@
-import { createServer, type Server } from 'http';
+import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'http';
 import { promises as fs, existsSync } from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { 
-  getAllData, 
-  listAllSessions, 
-  getActiveSession, 
+import {
+  getAllData,
+  listAllSessions,
+  getActiveSession,
   setActiveSession,
-  getCurrentSessionName 
+  getCurrentSessionName,
+  storeEvents,
+  type StoreChangeEvent,
 } from '../storage/store.js';
+
+// ---------------------------------------------------------------------------
+// SSE helpers
+// ---------------------------------------------------------------------------
+
+const SSE_HEARTBEAT_MS = 20_000;
+
+/**
+ * Parse a comma-separated ?tags=a,b,c query parameter into a lowercase array.
+ * Returns an empty array when the parameter is absent or empty.
+ */
+function parseTags(raw: string | null): string[] {
+  if (!raw) return [];
+  return raw.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+}
+
+/**
+ * Returns true when the event matches the optional tag/session filters.
+ * - tagFilter: OR-match — event passes when ANY tag in the filter appears in event.tags
+ * - sessionFilter: exact match against event.session
+ */
+function matchesFilter(
+  event: StoreChangeEvent,
+  tagFilter: string[],
+  sessionFilter: string | null,
+): boolean {
+  if (sessionFilter && event.session !== sessionFilter) return false;
+  if (tagFilter.length > 0) {
+    const eventTagsLower = event.tags.map((t) => t.toLowerCase());
+    if (!tagFilter.some((f) => eventTagsLower.includes(f))) return false;
+  }
+  return true;
+}
+
+/**
+ * Handle GET /api/events — Server-Sent Events stream.
+ *
+ * Query parameters:
+ *   ?tags=a,b   — OR-filter by tag (case-insensitive)
+ *   ?session=X  — filter by session name
+ *
+ * Protocol:
+ *   - Sends `event: ready\ndata: {}\n\n` immediately after connect.
+ *   - Forwards store 'change' events that pass the filter as `event: change\ndata: <json>\n\n`.
+ *   - Sends `: ping\n\n` heartbeats every 20 s to prevent proxy/idle timeouts.
+ *   - Cleans up listener + heartbeat interval on client disconnect.
+ */
+function handleSseRequest(req: IncomingMessage, res: ServerResponse, port: number): void {
+  // Parse filters from query string
+  const rawUrl = req.url ?? '/api/events';
+  const urlObj = new URL(rawUrl, `http://localhost:${port}`);
+  const tagFilter = parseTags(urlObj.searchParams.get('tags'));
+  const sessionFilter = urlObj.searchParams.get('session');
+
+  // SSE response headers.
+  // Note: CORS headers (Access-Control-Allow-Origin etc.) are already set via
+  // res.setHeader() in the outer request handler before routing; writeHead merges them.
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',   // disable nginx/Traefik response buffering
+  });
+
+  // Flush headers immediately so the client sees 200 + SSE headers right away.
+  // ServerResponse.flushHeaders() is part of Node's http module (Node 13.2+).
+  res.flushHeaders();
+
+  // Send initial ready event so the client knows the connection is live
+  res.write('event: ready\ndata: {}\n\n');
+
+  // Heartbeat to keep the connection alive through proxies
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch {
+      // connection already gone — cleanup handled by 'close' event below
+    }
+  }, SSE_HEARTBEAT_MS);
+
+  // Forward matching store events to this SSE client
+  const changeHandler = (event: StoreChangeEvent): void => {
+    if (!matchesFilter(event, tagFilter, sessionFilter)) return;
+    try {
+      res.write(`event: change\ndata: ${JSON.stringify(event)}\n\n`);
+    } catch {
+      // write failed, client disconnected — cleanup below
+    }
+  };
+
+  storeEvents.on('change', changeHandler);
+
+  // Cleanup on client disconnect
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    storeEvents.off('change', changeHandler);
+  });
+}
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB
 
@@ -106,6 +206,13 @@ export function createDashboardServer(port: number = 3456): Server {
               res.end(JSON.stringify({ error: err.message }));
             }
           });
+          return;
+        }
+
+        // GET /api/events - Server-Sent Events stream with optional tag/session filter
+        if (url.startsWith('/api/events') && method === 'GET') {
+          handleSseRequest(req, res, port);
+          // Do NOT call res.end() — the connection stays open until the client disconnects.
           return;
         }
 
