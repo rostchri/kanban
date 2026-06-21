@@ -1,4 +1,4 @@
-import { promises as fs, existsSync, mkdirSync } from "fs";
+import { promises as fs, existsSync, mkdirSync, watch as fsWatch } from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "child_process";
@@ -1002,6 +1002,237 @@ export async function recallTasks(
   };
 
   return { relevant, reasons, summary, quality };
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process change detection via fs.watch on the sessions directory.
+// The MCP server and the HTTP server run as SEPARATE OS processes — an
+// in-process EventEmitter cannot bridge that gap.  We bridge it via the
+// filesystem: every mutation writes a tasks.json file, and fs.watch fires
+// in the HTTP-server process so we can diff & emit the SSE change event.
+// ---------------------------------------------------------------------------
+
+/**
+ * Lightweight snapshot of a single task, used for change detection.
+ * Deliberately small — we only store fields that affect `StoreChangeEvent`.
+ */
+interface TaskSnapshot {
+  id: string;
+  status: TaskStatus;
+  /** Tag list serialised to a stable string for cheap equality check. */
+  tagsKey: string;
+  updatedAt: string;
+}
+
+/** In-memory snapshot: sessionName → Map<taskId, TaskSnapshot> */
+const _watchSnapshot = new Map<string, Map<string, TaskSnapshot>>();
+
+function _taskToSnapshot(task: Task): TaskSnapshot {
+  return {
+    id: task.id,
+    status: task.status,
+    tagsKey: [...task.tags].sort().join('\0'),
+    updatedAt: task.updatedAt,
+  };
+}
+
+/**
+ * Build a snapshot map for one session's task array.
+ */
+function _buildSessionSnapshot(tasks: Task[]): Map<string, TaskSnapshot> {
+  const m = new Map<string, TaskSnapshot>();
+  for (const t of tasks) {
+    m.set(t.id, _taskToSnapshot(t));
+  }
+  return m;
+}
+
+/**
+ * Diff the current tasks of one session against the stored snapshot and emit
+ * `storeEvents` change events for every detected mutation.
+ *
+ * @param session  Session name (used in the emitted event).
+ * @param tasks    Fresh task list read from disk.
+ */
+function _diffAndEmit(session: string, tasks: Task[]): void {
+  const prev = _watchSnapshot.get(session) ?? new Map<string, TaskSnapshot>();
+  const next = _buildSessionSnapshot(tasks);
+
+  // Detect created tasks
+  for (const [id, snap] of next) {
+    if (!prev.has(id)) {
+      const task = tasks.find((t) => t.id === id)!;
+      emitChange({
+        type: 'created',
+        taskId: id,
+        tags: task.tags,
+        status: snap.status,
+        session,
+        ts: Date.now(),
+      });
+    }
+  }
+
+  // Detect deleted tasks
+  for (const [id, prevSnap] of prev) {
+    if (!next.has(id)) {
+      emitChange({
+        type: 'deleted',
+        taskId: id,
+        // tags/status from the snapshot we still have
+        tags: prevSnap.tagsKey ? prevSnap.tagsKey.split('\0').filter(Boolean) : [],
+        status: prevSnap.status,
+        session,
+        ts: Date.now(),
+      });
+    }
+  }
+
+  // Detect updated / moved tasks
+  for (const [id, snap] of next) {
+    const p = prev.get(id);
+    if (!p) continue; // already handled as 'created' above
+
+    // Skip if nothing relevant changed (updatedAt is our cheapest guard)
+    if (p.updatedAt === snap.updatedAt) continue;
+
+    const task = tasks.find((t) => t.id === id)!;
+    const statusChanged = p.status !== snap.status;
+    const tagsChanged = p.tagsKey !== snap.tagsKey;
+
+    // 'moved': only the status column changed (mirrors updateTask logic)
+    const eventType: StoreChangeEvent['type'] =
+      statusChanged && !tagsChanged ? 'moved' : 'updated';
+
+    emitChange({
+      type: eventType,
+      taskId: id,
+      tags: task.tags,
+      status: snap.status,
+      session,
+      ts: Date.now(),
+    });
+  }
+
+  // Update snapshot
+  _watchSnapshot.set(session, next);
+}
+
+/**
+ * Load the initial snapshot for all existing sessions so the first fs.watch
+ * event doesn't produce spurious 'created' events for pre-existing tasks.
+ */
+async function _initWatchSnapshot(): Promise<void> {
+  if (!existsSync(SESSIONS_DIR)) return;
+
+  let entries: string[];
+  try {
+    const dirEntries = await fs.readdir(SESSIONS_DIR, { withFileTypes: true });
+    entries = dirEntries.filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    return;
+  }
+
+  await Promise.all(
+    entries.map(async (session) => {
+      const dataFile = getSessionDataFile(session);
+      try {
+        const raw = await fs.readFile(dataFile, 'utf-8');
+        const data: TaskFlowData = JSON.parse(raw);
+        _watchSnapshot.set(session, _buildSessionSnapshot(data.tasks ?? []));
+      } catch {
+        // Session dir exists but has no valid tasks.json yet — that's fine.
+        _watchSnapshot.set(session, new Map());
+      }
+    }),
+  );
+}
+
+/**
+ * Start watching the sessions directory for cross-process mutations.
+ *
+ * Call this ONCE in the HTTP-server process (startDashboardServer).
+ * The MCP-server process does NOT need this watcher — it emits in-process.
+ *
+ * Mechanism:
+ *  - `fs.watch` with `{ recursive: true }` fires whenever any file under
+ *    SESSIONS_DIR is changed.
+ *  - We debounce (150 ms) because fs.watch can fire multiple events for a
+ *    single logical write (rename + write, or inotify coalescing).
+ *  - On each debounce expiry we determine which session(s) changed from the
+ *    filename hint, re-read their tasks.json, diff against the in-memory
+ *    snapshot, and emit `storeEvents` change events.
+ *  - JSON parse errors are caught and skipped — a partial write is retried
+ *    on the next fs event automatically.
+ *
+ * NOTE: `fs.watch` with `recursive: true` works on Linux when the underlying
+ * kernel supports inotify (which it does on any modern Linux kernel ≥ 2.6.36).
+ * Alpine Linux in Docker ships a kernel that supports this.
+ */
+export async function watchStore(): Promise<void> {
+  ensureDir(SESSIONS_DIR);
+
+  // Populate initial snapshot before watching to avoid false 'created' events.
+  await _initWatchSnapshot();
+
+  // Pending debounce timers per session name (or '*' for global re-scan)
+  const pending = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * Re-read and diff one session's tasks file, then update the snapshot.
+   */
+  async function processSession(session: string): Promise<void> {
+    const dataFile = getSessionDataFile(session);
+    try {
+      const raw = await fs.readFile(dataFile, 'utf-8');
+      const data: TaskFlowData = JSON.parse(raw);
+      _diffAndEmit(session, data.tasks ?? []);
+    } catch {
+      // Partial write or non-existent file — skip; will retry on next event.
+    }
+  }
+
+  /**
+   * Schedule a debounced re-read for the given session.
+   */
+  function schedule(session: string): void {
+    const existing = pending.get(session);
+    if (existing !== undefined) clearTimeout(existing);
+
+    pending.set(
+      session,
+      setTimeout(() => {
+        pending.delete(session);
+        processSession(session).catch(() => {
+          // processSession is best-effort; ignore errors in the watcher
+        });
+      }, 150),
+    );
+  }
+
+  const watcher = fsWatch(
+    SESSIONS_DIR,
+    { recursive: true, persistent: false },
+    (eventType, filename) => {
+      if (!filename) return;
+
+      // filename looks like "independent/tasks.json" or "tasks.json" depending
+      // on the OS.  We want the first path segment as session name.
+      const parts = filename.split(path.sep);
+      const session = parts[0];
+
+      // Only react to tasks.json changes (ignore .tmp files and other files)
+      const basename = parts[parts.length - 1];
+      if (!basename || (!basename.endsWith('tasks.json') && basename !== 'tasks.json')) return;
+
+      schedule(session);
+    },
+  );
+
+  // Do not let this watcher keep the event-loop alive artificially —
+  // `persistent: false` already handles that (watcher won't prevent exit).
+  // We also set unref() as a belt-and-suspenders measure.
+  watcher.unref();
 }
 
 // Legacy init (creates dirs if needed)

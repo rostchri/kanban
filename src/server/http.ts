@@ -9,6 +9,7 @@ import {
   setActiveSession,
   getCurrentSessionName,
   storeEvents,
+  watchStore,
   type StoreChangeEvent,
 } from '../storage/store.js';
 
@@ -284,6 +285,13 @@ export async function startDashboardServer(port: number = 3456): Promise<Server>
       `Dashboard not built. Run 'npm run build:dashboard' first.\nExpected: ${DASHBOARD_DIR}`
     );
   }
+
+  // Start fs.watch-based cross-process change detection.
+  // This bridges the process boundary between the MCP-server process (which
+  // writes tasks.json) and this HTTP-server process (which serves /api/events).
+  // The watcher emits on `storeEvents` — the same emitter the SSE handler listens
+  // to — so no changes to the SSE logic are needed.
+  await watchStore();
 
   const server = createDashboardServer(port);
   return new Promise((resolve, reject) => {
