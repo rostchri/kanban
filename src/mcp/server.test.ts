@@ -52,10 +52,40 @@ import { VALID_STATUSES } from '../types.js';
 // ---------------------------------------------------------------------------
 // Re-implement the artifact recovery inline for unit testing without
 // spinning up the MCP server transport.
+// Must stay in sync with server.ts.
 // ---------------------------------------------------------------------------
 
-const ARTIFACT_TAIL_RE =
-  /<\/description>\s*(?:<parameter\s[^>]*name\s*=\s*["']tags["'][^>]*>([\s\S]*?)<\/parameter>)?([\s\S]*?)\s*$/;
+const ARTIFACT_SENTINEL_RE = /<\/description>/;
+
+function extractTagsFromArtifactTail(tail: string): string[] | undefined {
+  const bracketStart = tail.indexOf('[');
+  if (bracketStart === -1) return undefined;
+
+  let depth = 0;
+  let bracketEnd = -1;
+  for (let i = bracketStart; i < tail.length; i++) {
+    if (tail[i] === '[') depth++;
+    else if (tail[i] === ']') {
+      depth--;
+      if (depth === 0) { bracketEnd = i; break; }
+    }
+  }
+
+  if (bracketEnd === -1) {
+    const lastClose = tail.lastIndexOf(']');
+    if (lastClose === -1) return undefined;
+    bracketEnd = lastClose;
+  }
+
+  const candidate = tail.slice(bracketStart, bracketEnd + 1);
+  try {
+    const parsed = JSON.parse(candidate);
+    if (Array.isArray(parsed)) return parsed.map(String);
+  } catch {
+    // malformed — leave undefined
+  }
+  return undefined;
+}
 
 function recoverDescriptionAndTags(
   description: string | undefined,
@@ -64,22 +94,20 @@ function recoverDescriptionAndTags(
   if (!description) {
     return { description, tags: providedTags, recovered: false };
   }
-  const match = ARTIFACT_TAIL_RE.exec(description);
-  if (!match || !match[0].includes('</description>')) {
+  if (!ARTIFACT_SENTINEL_RE.test(description)) {
     return { description, tags: providedTags, recovered: false };
   }
   const cutIdx = description.indexOf('</description>');
   const cleanDescription = description.slice(0, cutIdx).trimEnd() || undefined;
   let recoveredTags: string[] | undefined = providedTags;
   const hasTags = Array.isArray(providedTags) && providedTags.length > 0;
-  if (!hasTags && match[1]) {
-    try {
-      const parsed = JSON.parse(match[1].trim());
-      if (Array.isArray(parsed)) {
-        recoveredTags = parsed.map(String);
-      }
-    } catch {
-      // leave as-is
+  if (!hasTags) {
+    const tail = description.slice(cutIdx);
+    const tagsParamMatch = /\bparameter\s[^>]*name\s*=\s*["']tags["'][^>]*>/i.exec(tail);
+    if (tagsParamMatch) {
+      const afterOpenTag = tail.slice(tagsParamMatch.index + tagsParamMatch[0].length);
+      const parsed = extractTagsFromArtifactTail(afterOpenTag);
+      if (parsed !== undefined) recoveredTags = parsed;
     }
   }
   return { description: cleanDescription, tags: recoveredTags, recovered: true };
@@ -138,6 +166,49 @@ describe('recoverDescriptionAndTags()', () => {
     assert.equal(result.description, undefined);
     assert.deepEqual(result.tags, ['a']);
     assert.equal(result.recovered, false);
+  });
+
+  // -------------------------------------------------------------------------
+  // Real-world mangle format: NO closing </parameter> — string ends after the
+  // JSON array.  This is the primary bug scenario that motivated the fix.
+  // -------------------------------------------------------------------------
+
+  it('recovers tags from real-world mangle WITHOUT closing </parameter>', () => {
+    // Exact format observed in production: string ends after the JSON array,
+    // no </parameter> present at all.
+    const mangled =
+      'Lange Beschreibung.</description>\n<parameter name="tags">["bug","ui","host:x"]';
+    const result = recoverDescriptionAndTags(mangled, undefined);
+    assert.equal(result.description, 'Lange Beschreibung.');
+    assert.deepEqual(result.tags, ['bug', 'ui', 'host:x']);
+    assert.equal(result.recovered, true);
+  });
+
+  it('real-world mangle: caller-provided tags take precedence over artifact tags', () => {
+    const mangled =
+      'Some task.</description>\n<parameter name="tags">["artifact-tag","host:y"]';
+    const result = recoverDescriptionAndTags(mangled, ['caller-tag', 'host:z']);
+    assert.equal(result.description, 'Some task.');
+    // Caller tags must win — artifact tags are ignored.
+    assert.deepEqual(result.tags, ['caller-tag', 'host:z']);
+    assert.equal(result.recovered, true);
+  });
+
+  it('real-world mangle: only-sentinel description becomes undefined, tags recovered', () => {
+    const mangled = '</description>\n<parameter name="tags">["kbtest","foolproof","host:chr-nas-bo"]';
+    const result = recoverDescriptionAndTags(mangled, undefined);
+    assert.equal(result.description, undefined);
+    assert.deepEqual(result.tags, ['kbtest', 'foolproof', 'host:chr-nas-bo']);
+    assert.equal(result.recovered, true);
+  });
+
+  it('real-world mangle: description clean when only-trim needed (no tags parameter)', () => {
+    // </description> present but no <parameter name="tags"> follows — only trim.
+    const mangled = 'Clean text.</description>\n<parameter name="status">todo</parameter>';
+    const result = recoverDescriptionAndTags(mangled, undefined);
+    assert.equal(result.description, 'Clean text.');
+    assert.equal(result.tags, undefined);
+    assert.equal(result.recovered, true);
   });
 });
 

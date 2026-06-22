@@ -32,21 +32,78 @@ import { VALID_STATUSES, type TaskStatus } from "../types.js";
 // ---------------------------------------------------------------------------
 
 /**
- * Regex that matches the specific mangled tail that AI tool-call clients
- * sometimes append when a long `description` causes parameter bleeding:
+ * Regex that detects the artifact sentinel `</description>` in a description
+ * string — we require it to appear and everything from that point onward is
+ * the "artifact tail" that must be trimmed.
  *
- *   </description>
- *   <parameter name="tags">["a","b"]</parameter>
- *   ... (any remaining leaked XML)
+ * We deliberately do NOT try to parse the tags array inside the regex because
+ * the real-world mangle format omits the closing `</parameter>`, making a
+ * single capturing group unreliable.  Tag extraction is done imperatively
+ * below using bracket-matching instead.
  *
- * We anchor to the END of the string (with optional trailing whitespace) so
- * we never accidentally trim mid-description text that happens to mention
- * XML-looking strings.
- *
- * Group 1 (optional): the JSON array inside a <parameter name="tags"> element.
+ * Anchor: the sentinel must be present for the match to succeed.
  */
-const ARTIFACT_TAIL_RE =
-  /<\/description>\s*(?:<parameter\s[^>]*name\s*=\s*["']tags["'][^>]*>([\s\S]*?)<\/parameter>)?([\s\S]*?)\s*$/;
+const ARTIFACT_SENTINEL_RE = /<\/description>/;
+
+/**
+ * Extract a JSON array from a string that starts somewhere after
+ * `<parameter name="tags">`.  Handles the two known formats:
+ *
+ *   WITH closing tag:    `["a","b"]</parameter>`
+ *   WITHOUT closing tag: `["a","b"]`  (string ends there)
+ *
+ * Uses simple bracket-counting rather than a regex so it is robust against
+ * nested brackets in tag values.
+ *
+ * Returns the parsed string[] on success, or undefined on any parse error.
+ */
+function extractTagsFromArtifactTail(tail: string): string[] | undefined {
+  // Find the opening bracket of the JSON array.
+  const bracketStart = tail.indexOf("[");
+  if (bracketStart === -1) {
+    return undefined;
+  }
+
+  // Walk forward to find the matching closing bracket.
+  let depth = 0;
+  let bracketEnd = -1;
+  for (let i = bracketStart; i < tail.length; i++) {
+    if (tail[i] === "[") {
+      depth++;
+    } else if (tail[i] === "]") {
+      depth--;
+      if (depth === 0) {
+        bracketEnd = i;
+        break;
+      }
+    }
+  }
+
+  if (bracketEnd === -1) {
+    // Unclosed bracket — try using the last `]` in the string as a fallback.
+    const lastClose = tail.lastIndexOf("]");
+    if (lastClose === -1) {
+      return undefined;
+    }
+    bracketEnd = lastClose;
+  }
+
+  const candidate = tail.slice(bracketStart, bracketEnd + 1);
+
+  try {
+    const parsed = JSON.parse(candidate);
+    if (Array.isArray(parsed)) {
+      return parsed.map(String);
+    }
+  } catch {
+    // Malformed JSON — leave tags empty, do not crash.
+    process.stderr.write(
+      `[kanban-mcp] WARN: could not parse tags array from artifact tail: ${candidate}\n`,
+    );
+  }
+
+  return undefined;
+}
 
 /**
  * Recover a potentially mangled `description` + `tags` pair.
@@ -55,15 +112,25 @@ const ARTIFACT_TAIL_RE =
  * next parameter — the `tags` JSON array ends up appended to the description
  * text as literal XML while `tags` arrives empty/missing.
  *
+ * Two confirmed real-world formats are handled:
+ *
+ *   WITH closing </parameter>:
+ *     `...real text</description>\n<parameter name="tags">["a","b"]</parameter>`
+ *
+ *   WITHOUT closing </parameter> (the common case!):
+ *     `...real text</description>\n<parameter name="tags">["a","b"]`
+ *
  * Behaviour:
- *  - If the description does NOT end with the artifact tail: returns inputs unchanged.
+ *  - If the description does NOT contain `</description>`: returns inputs unchanged.
  *  - If it does:
- *    - Strips the artifact tail from the description.
- *    - When `providedTags` is empty/absent AND a JSON array is found in the
- *      artifact: parses that array and uses it as the recovered tags.
+ *    - Strips everything from `</description>` onward from the description.
+ *    - When `providedTags` is empty/absent: extracts the JSON array after
+ *      `<parameter name="tags">` via bracket-matching (no </parameter> needed).
+ *    - When `providedTags` is non-empty: caller tags take precedence, artifact
+ *      tags are ignored.
  *    - Logs a warning (stderr) so operators can see recoveries in container logs.
  *
- * Conservative by design: only acts on the specific end-of-string pattern.
+ * Conservative by design: only acts when `</description>` is present.
  */
 function recoverDescriptionAndTags(
   description: string | undefined,
@@ -73,10 +140,7 @@ function recoverDescriptionAndTags(
     return { description, tags: providedTags, recovered: false };
   }
 
-  const match = ARTIFACT_TAIL_RE.exec(description);
-  // The tail must start with </description> — if the regex matches but the
-  // matched portion doesn't contain that sentinel, skip recovery.
-  if (!match || !match[0].includes("</description>")) {
+  if (!ARTIFACT_SENTINEL_RE.test(description)) {
     return { description, tags: providedTags, recovered: false };
   }
 
@@ -84,18 +148,20 @@ function recoverDescriptionAndTags(
   const cutIdx = description.indexOf("</description>");
   const cleanDescription = description.slice(0, cutIdx).trimEnd() || undefined;
 
-  // Attempt to parse tags from the captured group if caller sent none.
+  // Attempt to recover tags from the artifact tail if caller sent none.
   let recoveredTags: string[] | undefined = providedTags;
   const hasTags = Array.isArray(providedTags) && providedTags.length > 0;
 
-  if (!hasTags && match[1]) {
-    try {
-      const parsed = JSON.parse(match[1].trim());
-      if (Array.isArray(parsed)) {
-        recoveredTags = parsed.map(String);
+  if (!hasTags) {
+    const tail = description.slice(cutIdx); // everything from </description> onward
+    // Look for <parameter name="tags"> — case-insensitive for robustness.
+    const tagsParamMatch = /\bparameter\s[^>]*name\s*=\s*["']tags["'][^>]*>/i.exec(tail);
+    if (tagsParamMatch) {
+      const afterOpenTag = tail.slice(tagsParamMatch.index + tagsParamMatch[0].length);
+      const parsed = extractTagsFromArtifactTail(afterOpenTag);
+      if (parsed !== undefined) {
+        recoveredTags = parsed;
       }
-    } catch {
-      // Malformed JSON in the artifact — leave tags as-is.
     }
   }
 
