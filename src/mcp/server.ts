@@ -25,7 +25,118 @@ import {
   getCurrentSessionName,
   setActiveSession,
 } from "../storage/store.js";
-import { VALID_STATUSES } from "../types.js";
+import { VALID_STATUSES, type TaskStatus } from "../types.js";
+
+// ---------------------------------------------------------------------------
+// Tool-call artifact recovery
+// ---------------------------------------------------------------------------
+
+/**
+ * Regex that matches the specific mangled tail that AI tool-call clients
+ * sometimes append when a long `description` causes parameter bleeding:
+ *
+ *   </description>
+ *   <parameter name="tags">["a","b"]</parameter>
+ *   ... (any remaining leaked XML)
+ *
+ * We anchor to the END of the string (with optional trailing whitespace) so
+ * we never accidentally trim mid-description text that happens to mention
+ * XML-looking strings.
+ *
+ * Group 1 (optional): the JSON array inside a <parameter name="tags"> element.
+ */
+const ARTIFACT_TAIL_RE =
+  /<\/description>\s*(?:<parameter\s[^>]*name\s*=\s*["']tags["'][^>]*>([\s\S]*?)<\/parameter>)?([\s\S]*?)\s*$/;
+
+/**
+ * Recover a potentially mangled `description` + `tags` pair.
+ *
+ * Handles the known AI tool-call bug where long descriptions bleed into the
+ * next parameter — the `tags` JSON array ends up appended to the description
+ * text as literal XML while `tags` arrives empty/missing.
+ *
+ * Behaviour:
+ *  - If the description does NOT end with the artifact tail: returns inputs unchanged.
+ *  - If it does:
+ *    - Strips the artifact tail from the description.
+ *    - When `providedTags` is empty/absent AND a JSON array is found in the
+ *      artifact: parses that array and uses it as the recovered tags.
+ *    - Logs a warning (stderr) so operators can see recoveries in container logs.
+ *
+ * Conservative by design: only acts on the specific end-of-string pattern.
+ */
+function recoverDescriptionAndTags(
+  description: string | undefined,
+  providedTags: string[] | undefined,
+): { description: string | undefined; tags: string[] | undefined; recovered: boolean } {
+  if (!description) {
+    return { description, tags: providedTags, recovered: false };
+  }
+
+  const match = ARTIFACT_TAIL_RE.exec(description);
+  // The tail must start with </description> — if the regex matches but the
+  // matched portion doesn't contain that sentinel, skip recovery.
+  if (!match || !match[0].includes("</description>")) {
+    return { description, tags: providedTags, recovered: false };
+  }
+
+  // Trim the artifact tail: everything from the first </description> onward.
+  const cutIdx = description.indexOf("</description>");
+  const cleanDescription = description.slice(0, cutIdx).trimEnd() || undefined;
+
+  // Attempt to parse tags from the captured group if caller sent none.
+  let recoveredTags: string[] | undefined = providedTags;
+  const hasTags = Array.isArray(providedTags) && providedTags.length > 0;
+
+  if (!hasTags && match[1]) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (Array.isArray(parsed)) {
+        recoveredTags = parsed.map(String);
+      }
+    } catch {
+      // Malformed JSON in the artifact — leave tags as-is.
+    }
+  }
+
+  process.stderr.write(
+    `[kanban-mcp] WARN: tool-call artifact detected in description — trimmed tail and recovered tags: ${JSON.stringify(recoveredTags ?? [])}\n`,
+  );
+
+  return { description: cleanDescription, tags: recoveredTags, recovered: true };
+}
+
+// ---------------------------------------------------------------------------
+// Strict status validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates that `value` is a member of VALID_STATUSES.
+ *
+ * Throws a descriptive Error when invalid — never silently defaults.
+ * Returns the typed TaskStatus on success.
+ */
+function requireValidStatus(value: unknown, fieldName: string = "status"): TaskStatus {
+  if (typeof value !== "string" || !(VALID_STATUSES as string[]).includes(value)) {
+    throw new Error(
+      `Invalid ${fieldName}: "${value}". Must be one of: ${VALID_STATUSES.join(", ")}.`,
+    );
+  }
+  return value as TaskStatus;
+}
+
+/**
+ * Like requireValidStatus but only validates when a value is present.
+ * Returns undefined when value is absent (undefined/null).
+ */
+function validateOptionalStatus(value: unknown): TaskStatus | undefined {
+  if (value === undefined || value === null) return undefined;
+  return requireValidStatus(value);
+}
+
+// ---------------------------------------------------------------------------
+// Agent detection
+// ---------------------------------------------------------------------------
 
 function detectAgent(): "claude" | "opencode" {
   if (process.env.CLAUDE_CODE) return "claude";
@@ -88,7 +199,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "task_create",
-        description: "Create a new task on the Kanban board",
+        description:
+          "Create a new task on the Kanban board. " +
+          "IMPORTANT: The response includes the resulting id, status and tags — verify them to confirm the task was created correctly.",
         inputSchema: {
           type: "object",
           properties: {
@@ -100,12 +213,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             status: {
               type: "string",
               enum: VALID_STATUSES,
-              description: "Initial status (default: todo)",
+              description: `Initial status. Must be one of: ${VALID_STATUSES.join(", ")}. Defaults to "todo" when omitted.`,
             },
             tags: {
               type: "array",
               items: { type: "string" },
-              description: "Optional tags for categorization",
+              description:
+                "Optional tags for categorization. Pass as a JSON array, e.g. [\"bug\", \"host:srv01\"]. " +
+                "Do NOT embed tags inside the description field — use this parameter.",
             },
           },
           required: ["title"],
@@ -113,20 +228,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "task_update",
-        description: "Update an existing task",
+        description:
+          "Update fields of an existing task. " +
+          "IMPORTANT: The response includes the resulting id, status and tags — verify them to confirm the update was applied correctly.",
         inputSchema: {
           type: "object",
           properties: {
             id: { type: "string", description: "Task ID (required)" },
-            title: { type: "string" },
-            description: { type: "string" },
+            title: { type: "string", description: "New title" },
+            description: { type: "string", description: "New description" },
             status: {
               type: "string",
               enum: VALID_STATUSES,
+              description: `New status. Must be one of: ${VALID_STATUSES.join(", ")}.`,
             },
             tags: {
               type: "array",
               items: { type: "string" },
+              description: "Replacement tag list (replaces all existing tags)",
             },
           },
           required: ["id"],
@@ -134,7 +253,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "task_move",
-        description: "Move a task to a different status column",
+        description:
+          "Move a task to a different status column. " +
+          "Use the 'status' parameter (NOT 'column'). " +
+          "IMPORTANT: The response includes the resulting id, status and tags — verify them.",
         inputSchema: {
           type: "object",
           properties: {
@@ -142,7 +264,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             status: {
               type: "string",
               enum: VALID_STATUSES,
-              description: "New status (required)",
+              description: `New status (required). Must be one of: ${VALID_STATUSES.join(", ")}.`,
             },
           },
           required: ["id", "status"],
@@ -162,18 +284,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "task_list",
         description:
-          "List all tasks in the current session, optionally filtered",
+          "List all tasks in the current session, optionally filtered. " +
+          "Returns tasks for ALL statuses including 'archive' by default.",
         inputSchema: {
           type: "object",
           properties: {
             status: {
               type: "string",
               enum: VALID_STATUSES,
-              description: "Filter by status",
+              description: `Filter by status. Must be one of: ${VALID_STATUSES.join(", ")}. Omit to get all tasks.`,
             },
             tag: {
               type: "string",
-              description: "Filter by tag",
+              description: "Filter by tag (exact match)",
             },
             query: {
               type: "string",
@@ -265,61 +388,120 @@ server.setRequestHandler(
     try {
       switch (name) {
         case "task_create": {
+          if (!args.title || typeof args.title !== "string" || !args.title.trim()) {
+            return {
+              content: [{ type: "text", text: "Error: 'title' is required and must be a non-empty string." }],
+              isError: true,
+            };
+          }
+
+          // Recover mangled description / tags from tool-call artifact bleeding.
+          const rawTags = Array.isArray(args.tags) ? args.tags.map(String) : undefined;
+          const { description, tags, recovered } = recoverDescriptionAndTags(
+            args.description ? String(args.description) : undefined,
+            rawTags,
+          );
+
+          // Validate optional status — error if provided but invalid.
+          const status = args.status !== undefined && args.status !== null
+            ? requireValidStatus(args.status)
+            : "todo";
+
           const task = await createTask({
-            title: String(args.title),
-            description: args.description
-              ? String(args.description)
-              : undefined,
-            status: VALID_STATUSES.includes(args.status as any)
-              ? (args.status as any)
-              : "todo",
-            tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
+            title: String(args.title).trim(),
+            description,
+            status,
+            tags,
             source: CURRENT_AGENT,
           });
           const sessionName = await getCurrentSessionName();
+
+          const recoveryNote = recovered
+            ? "\nWARNING: Tool-call artifact detected — description was trimmed and/or tags were recovered. Please verify the values below."
+            : "";
+
           return {
             content: [
               {
                 type: "text",
-                text: `Created task "${task.title}" (${task.id}) in ${task.status} [Session: ${sessionName}]`,
+                text:
+                  `Created task "${task.title}" in session "${sessionName}".${recoveryNote}\n` +
+                  `VERIFY: id=${task.id} | status=${task.status} | tags=${JSON.stringify(task.tags)}`,
               },
             ],
           };
         }
 
         case "task_update": {
-          const task = await updateTask(String(args.id), {
-            title: args.title !== undefined ? String(args.title) : undefined,
-            description:
-              args.description !== undefined
-                ? String(args.description)
-                : undefined,
-            status: VALID_STATUSES.includes(args.status as any)
-              ? (args.status as any)
-              : undefined,
-            tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
-          });
-          if (!task) {
+          if (!args.id || typeof args.id !== "string") {
             return {
-              content: [{ type: "text", text: `Task ${args.id} not found` }],
+              content: [{ type: "text", text: "Error: 'id' is required." }],
               isError: true,
             };
           }
+
+          // Recover mangled description / tags from tool-call artifact bleeding.
+          const rawTags = Array.isArray(args.tags) ? args.tags.map(String) : undefined;
+          const rawDesc = args.description !== undefined ? String(args.description) : undefined;
+          const { description, tags, recovered } = recoverDescriptionAndTags(rawDesc, rawTags);
+
+          // Validate optional status — error if provided but invalid.
+          const status = validateOptionalStatus(args.status);
+
+          const task = await updateTask(String(args.id), {
+            title: args.title !== undefined ? String(args.title) : undefined,
+            description,
+            status,
+            tags,
+          });
+          if (!task) {
+            return {
+              content: [{ type: "text", text: `Error: Task ${args.id} not found.` }],
+              isError: true,
+            };
+          }
+
+          const recoveryNote = recovered
+            ? "\nWARNING: Tool-call artifact detected — description was trimmed and/or tags were recovered. Please verify the values below."
+            : "";
+
           return {
             content: [
               {
                 type: "text",
-                text: `Updated task "${task.title}" (${task.id})`,
+                text:
+                  `Updated task "${task.title}".${recoveryNote}\n` +
+                  `VERIFY: id=${task.id} | status=${task.status} | tags=${JSON.stringify(task.tags)}`,
               },
             ],
           };
         }
 
         case "task_move": {
-          const task = await moveTask(String(args.id), args.status as any);
+          if (!args.id || typeof args.id !== "string") {
+            return {
+              content: [{ type: "text", text: "Error: 'id' is required." }],
+              isError: true,
+            };
+          }
+          // Strict validation — never silently default.
+          if (args.status === undefined || args.status === null) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Error: 'status' is required for task_move. Must be one of: ${VALID_STATUSES.join(", ")}.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const status = requireValidStatus(args.status);
+
+          const task = await moveTask(String(args.id), status);
           if (!task) {
             return {
-              content: [{ type: "text", text: `Task ${args.id} not found` }],
+              content: [{ type: "text", text: `Error: Task ${args.id} not found.` }],
               isError: true,
             };
           }
@@ -327,31 +509,43 @@ server.setRequestHandler(
             content: [
               {
                 type: "text",
-                text: `Moved "${task.title}" to ${task.status}`,
+                text:
+                  `Moved "${task.title}" to ${task.status}.\n` +
+                  `VERIFY: id=${task.id} | status=${task.status} | tags=${JSON.stringify(task.tags)}`,
               },
             ],
           };
         }
 
         case "task_delete": {
+          if (!args.id || typeof args.id !== "string") {
+            return {
+              content: [{ type: "text", text: "Error: 'id' is required." }],
+              isError: true,
+            };
+          }
           const ok = await deleteTask(String(args.id));
           return {
             content: [
               {
                 type: "text",
                 text: ok
-                  ? `Deleted task ${args.id}`
-                  : `Task ${args.id} not found`,
+                  ? `Deleted task ${args.id}.`
+                  : `Error: Task ${args.id} not found.`,
               },
             ],
+            isError: !ok,
           };
         }
 
         case "task_list": {
+          // Validate optional status filter — error if provided but invalid.
+          const statusFilter = args.status !== undefined && args.status !== null
+            ? requireValidStatus(args.status)
+            : undefined;
+
           const tasks = await listTasks(undefined, {
-            status: VALID_STATUSES.includes(args.status as any)
-              ? (args.status as any)
-              : undefined,
+            status: statusFilter,
             tag: args.tag ? String(args.tag) : undefined,
             query: args.query ? String(args.query) : undefined,
           });
@@ -381,10 +575,22 @@ server.setRequestHandler(
         }
 
         case "task_append_note": {
+          if (!args.id || typeof args.id !== "string") {
+            return {
+              content: [{ type: "text", text: "Error: 'id' is required." }],
+              isError: true,
+            };
+          }
+          if (!args.note || typeof args.note !== "string") {
+            return {
+              content: [{ type: "text", text: "Error: 'note' is required and must be a non-empty string." }],
+              isError: true,
+            };
+          }
           const task = await appendNote(String(args.id), String(args.note));
           if (!task) {
             return {
-              content: [{ type: "text", text: `Task ${args.id} not found` }],
+              content: [{ type: "text", text: `Error: Task ${args.id} not found.` }],
               isError: true,
             };
           }
@@ -440,10 +646,16 @@ server.setRequestHandler(
         }
 
         case "task_get": {
+          if (!args.id || typeof args.id !== "string") {
+            return {
+              content: [{ type: "text", text: "Error: 'id' is required." }],
+              isError: true,
+            };
+          }
           const task = await getTask(String(args.id));
           if (!task) {
             return {
-              content: [{ type: "text", text: `Task ${args.id} not found` }],
+              content: [{ type: "text", text: `Error: Task ${args.id} not found.` }],
               isError: true,
             };
           }
@@ -483,6 +695,12 @@ server.setRequestHandler(
         }
 
         case "session_switch": {
+          if (!args.name || typeof args.name !== "string") {
+            return {
+              content: [{ type: "text", text: "Error: 'name' is required." }],
+              isError: true,
+            };
+          }
           const targetName = String(args.name);
           const sessions = await listAllSessions();
           const exists = sessions.some((s) => s.name === targetName);
@@ -491,7 +709,7 @@ server.setRequestHandler(
               content: [
                 {
                   type: "text",
-                  text: `Session "${targetName}" not found. Use session_list to see available sessions.`,
+                  text: `Error: Session "${targetName}" not found. Use session_list to see available sessions.`,
                 },
               ],
               isError: true,

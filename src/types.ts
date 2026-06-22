@@ -1,4 +1,4 @@
-export type TaskStatus = "todo" | "in-progress" | "done" | "blocked";
+export type TaskStatus = "todo" | "in-progress" | "done" | "blocked" | "archive";
 
 export interface Task {
   id: string;
@@ -31,6 +31,7 @@ export const VALID_STATUSES: TaskStatus[] = [
   "in-progress",
   "done",
   "blocked",
+  "archive",
 ];
 
 export const STATUS_LABELS: Record<TaskStatus, string> = {
@@ -38,6 +39,7 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   "in-progress": "In Progress",
   done: "Done",
   blocked: "Blocked",
+  archive: "Archive",
 };
 
 export const STATUS_COLORS: Record<TaskStatus, string> = {
@@ -45,4 +47,5 @@ export const STATUS_COLORS: Record<TaskStatus, string> = {
   "in-progress": "#3B82F6",
   done: "#10B981",
   blocked: "#EF4444",
+  archive: "#6B7280",
 };

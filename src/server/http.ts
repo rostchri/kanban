@@ -8,10 +8,12 @@ import {
   getActiveSession,
   setActiveSession,
   getCurrentSessionName,
+  moveTask,
   storeEvents,
   watchStore,
   type StoreChangeEvent,
 } from '../storage/store.js';
+import { VALID_STATUSES } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // SSE helpers
@@ -214,6 +216,74 @@ export function createDashboardServer(port: number = 3456): Server {
         if (url.startsWith('/api/events') && method === 'GET') {
           handleSseRequest(req, res, port);
           // Do NOT call res.end() — the connection stays open until the client disconnects.
+          return;
+        }
+
+        // POST /api/tasks/:id/status  — move a task to a different status column.
+        // Body: { "status": "<enum>" }
+        // Returns: the updated task as JSON, or an error object.
+        // This write path triggers the Store's EventEmitter → SSE/polling consumers
+        // see the change in real time, consistent with MCP-originated mutations.
+        const taskMoveMatch = url.match(/^\/api\/tasks\/([^/]+)\/(?:status|move)$/);
+        if (taskMoveMatch && method === 'POST') {
+          const taskId = decodeURIComponent(taskMoveMatch[1]);
+          let body = '';
+          let bodySize = 0;
+          let aborted = false;
+          req.on('data', (chunk) => {
+            if (aborted) return;
+            bodySize += chunk.length;
+            if (bodySize > MAX_BODY_SIZE) {
+              aborted = true;
+              res.writeHead(413, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Request body too large' }));
+              return;
+            }
+            body += chunk;
+          });
+          req.on('end', async () => {
+            if (aborted) return;
+            try {
+              let parsed: unknown;
+              try {
+                parsed = JSON.parse(body);
+              } catch {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+                return;
+              }
+              if (
+                typeof parsed !== 'object' ||
+                parsed === null ||
+                !('status' in parsed)
+              ) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Body must contain a "status" field.' }));
+                return;
+              }
+              const { status } = parsed as Record<string, unknown>;
+              if (typeof status !== 'string' || !(VALID_STATUSES as string[]).includes(status)) {
+                res.writeHead(422, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    error: `Invalid status: "${status}". Must be one of: ${VALID_STATUSES.join(', ')}.`,
+                  }),
+                );
+                return;
+              }
+              const task = await moveTask(taskId, status as (typeof VALID_STATUSES)[number]);
+              if (!task) {
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `Task "${taskId}" not found.` }));
+                return;
+              }
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(task));
+            } catch (err: any) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: err.message }));
+            }
+          });
           return;
         }
 
