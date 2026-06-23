@@ -9,6 +9,7 @@ import {
   setActiveSession,
   getCurrentSessionName,
   moveTask,
+  deleteTask,
   storeEvents,
   watchStore,
   type StoreChangeEvent,
@@ -284,6 +285,29 @@ export function createDashboardServer(port: number = 3456): Server {
               res.end(JSON.stringify({ error: err.message }));
             }
           });
+          return;
+        }
+
+        // DELETE /api/tasks/:id  — delete a task.
+        // Returns: { "deleted": "<id>" } on success, 404 if not found.
+        // Triggers the Store's EventEmitter → SSE 'deleted' event (consistent with
+        // MCP-originated deletions).
+        const taskDeleteMatch = url.match(/^\/api\/tasks\/([^/]+)$/);
+        if (taskDeleteMatch && method === 'DELETE') {
+          const taskId = decodeURIComponent(taskDeleteMatch[1]);
+          try {
+            const ok = await deleteTask(taskId);
+            if (!ok) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: `Task "${taskId}" not found.` }));
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ deleted: taskId }));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          }
           return;
         }
 
