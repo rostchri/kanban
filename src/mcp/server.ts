@@ -27,6 +27,25 @@ import {
 } from "../storage/store.js";
 import { VALID_STATUSES, type TaskStatus } from "../types.js";
 
+/**
+ * Stati, die "offene Arbeit" bedeuten — der Default von task_list.
+ *
+ * Warum ein Default noetig wurde: das Board waechst, und task_list lieferte
+ * ausnahmslos JEDEN Task zurueck. Bei 694 Tasks waren das 126 KB (~36.000
+ * Token) pro Aufruf — ein Viertel des Kontextfensters eines 147k-Modells,
+ * bei kleineren Modellen mehr als das ganze. Gemessen: 82 % davon entfielen
+ * auf `archive` (380) und `done` (192), also auf abgeschlossene Arbeit, die
+ * ein Agent beim "was ist zu tun?" gar nicht sehen will.
+ *
+ * `in-progress` gehoert bewusst DAZU: wer nach offener Arbeit fragt, meint
+ * auch das, was bereits laeuft — sonst sieht ein Agent seine eigenen aktiven
+ * Tickets nicht und legt Duplikate an.
+ */
+const OPEN_STATUSES: TaskStatus[] = ["todo", "in-progress", "blocked"];
+
+/** Obergrenze fuer eine task_list-Antwort, wenn der Aufrufer nichts vorgibt. */
+const TASK_LIST_DEFAULT_LIMIT = 100;
+
 // ---------------------------------------------------------------------------
 // Tool-call artifact recovery
 // ---------------------------------------------------------------------------
@@ -350,15 +369,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "task_list",
         description:
-          "List all tasks in the current session, optionally filtered. " +
-          "Returns tasks for ALL statuses including 'archive' by default.",
+          "List OPEN tasks in the current session (todo, in-progress, blocked). " +
+          "Finished work is NOT included by default: pass status:\"done\" or " +
+          "status:\"archive\" to see it, or status:\"all\" for everything. " +
+          "Results are capped at 100 by default — raise with limit, page with offset. " +
+          "The response reports total/shown so you can tell when results were cut off.",
         inputSchema: {
           type: "object",
           properties: {
             status: {
               type: "string",
-              enum: VALID_STATUSES,
-              description: `Filter by status. Must be one of: ${VALID_STATUSES.join(", ")}. Omit to get all tasks.`,
+              enum: [...VALID_STATUSES, "all"],
+              description:
+                `Filter by a single status (${VALID_STATUSES.join(", ")}), or "all" for every status. ` +
+                `Omitted = open work only (${OPEN_STATUSES.join(", ")}).`,
             },
             tag: {
               type: "string",
@@ -367,7 +391,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             query: {
               type: "string",
               description:
-                "Search query to filter tasks by title or description (case-insensitive)",
+                "Search query to filter tasks by title or description (case-insensitive). " +
+                "Searches ALL statuses, not just open ones — a search should find what you look for.",
+            },
+            limit: {
+              type: "number",
+              description: `Maximum tasks to return (default ${TASK_LIST_DEFAULT_LIMIT}).`,
+            },
+            offset: {
+              type: "number",
+              description: "Skip this many tasks before returning (for paging).",
             },
           },
         },
@@ -605,36 +638,82 @@ server.setRequestHandler(
         }
 
         case "task_list": {
-          // Validate optional status filter — error if provided but invalid.
-          const statusFilter = args.status !== undefined && args.status !== null
-            ? requireValidStatus(args.status)
-            : undefined;
+          // "all" hebt den Offen-Default auf; jeder andere Wert wird wie bisher
+          // als einzelner Status validiert (Tippfehler sollen weiterhin einen
+          // Fehler geben, nicht stillschweigend alles zurueckliefern).
+          const wantsAll = args.status === "all";
+          const statusFilter =
+            !wantsAll && args.status !== undefined && args.status !== null
+              ? requireValidStatus(args.status)
+              : undefined;
+          const queryText = args.query ? String(args.query) : undefined;
 
           const tasks = await listTasks(undefined, {
             status: statusFilter,
             tag: args.tag ? String(args.tag) : undefined,
-            query: args.query ? String(args.query) : undefined,
+            query: queryText,
           });
+
+          // Der Offen-Default greift nur, wenn der Aufrufer WEDER einen Status
+          // NOCH eine Suche vorgegeben hat. Eine Suche muss finden, wonach
+          // gesucht wird — auch in abgeschlossenen Tasks; sonst waere ein
+          // "gibt es das Ticket schon?" truegerisch negativ und man legt ein
+          // Duplikat an.
+          const defaultFilterApplied =
+            !wantsAll && statusFilter === undefined && queryText === undefined;
+          const scoped = defaultFilterApplied
+            ? tasks.filter((t) => OPEN_STATUSES.includes(t.status))
+            : tasks;
+
+          const total = scoped.length;
+          const offset = Math.max(0, Number(args.offset) || 0);
+          const limit =
+            args.limit !== undefined && args.limit !== null
+              ? Math.max(1, Number(args.limit))
+              : TASK_LIST_DEFAULT_LIMIT;
+          const page = scoped.slice(offset, offset + limit);
+
           const sessionName = await getCurrentSessionName();
-          if (tasks.length === 0) {
+          if (total === 0) {
+            const hint = defaultFilterApplied
+              ? ` with open status (${OPEN_STATUSES.join(", ")}). Use status:"done", status:"archive" or status:"all" to see finished work.`
+              : "";
             return {
               content: [
                 {
                   type: "text",
-                  text: `No tasks found in session "${sessionName}"`,
+                  text: `No tasks found in session "${sessionName}"${hint}`,
                 },
               ],
             };
           }
-          const lines = tasks.map(
+
+          const lines = page.map(
             (t) =>
               `[${t.status}] ${t.title} (${t.id}) ${t.tags.length > 0 ? "#" + t.tags.join(" #") : ""}`,
           );
+
+          // Kopfzeile sagt IMMER, was gezeigt wird und was fehlt. Ohne diesen
+          // Hinweis haelt ein Agent eine gefilterte oder gekuerzte Liste fuer
+          // vollstaendig und zieht falsche Schluesse ("gibt es nicht").
+          const shown = page.length;
+          const scopeNote = defaultFilterApplied
+            ? `open only (${OPEN_STATUSES.join(", ")}) — status:"done"/"archive"/"all" for the rest`
+            : wantsAll
+              ? "all statuses"
+              : statusFilter
+                ? `status ${statusFilter}`
+                : "search across all statuses";
+          const pageNote =
+            shown < total
+              ? ` — showing ${offset + 1}-${offset + shown} of ${total}, use offset/limit for more`
+              : ` — ${total} shown`;
+
           return {
             content: [
               {
                 type: "text",
-                text: `Session: ${sessionName}\n${lines.join("\n")}`,
+                text: `Session: ${sessionName} [${scopeNote}]${pageNote}\n${lines.join("\n")}`,
               },
             ],
           };
