@@ -127,7 +127,7 @@ test("MCP e2e (stdio): append_note model/agent, warnings, unknown params tolerat
     // unknown param on task_create (z.B. spaeterer Hook-Zusatz) wird toleriert
     const created = await client.callTool({ name: "task_create", arguments: { title: "e2e", bogus: 1 } });
     assert.ok(!created.isError);
-    const id = text(created).match(/\(([^)]+)\)/)[1];
+    const id = (text(created).match(/id=([^\s|]+)/) ?? text(created).match(/\(([^)]+)\)/))[1];
     const upd = await client.callTool({ name: "task_update", arguments: { id, status: "in-progress", bogus: "x" } });
     assert.ok(!upd.isError);
 

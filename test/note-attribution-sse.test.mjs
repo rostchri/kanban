@@ -94,3 +94,47 @@ test("cross-process polling path (file changed externally) emits event with note
   assert.deepEqual(ev.task.noteMeta, [{ model: "m/poll", agent: "main" }]);
   store._testResetPollState();
 });
+
+test("Regression realtime-sse: DELETE /api/tasks/:id, archive status, task_list limit/offset unaffected", async () => {
+  const { createDashboardServer } = await import("../dist/server/http.js");
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+  const ids = [];
+  for (let i = 0; i < 4; i++) ids.push((await store.createTask({ title: `reg-${i}` })).id);
+  await store.appendNote(ids[0], "n", undefined, { model: "m/x" });
+
+  // DELETE + SSE 'deleted'
+  const server = createDashboardServer();
+  await new Promise((res) => server.listen(0, "127.0.0.1", res));
+  try {
+    const { port } = server.address();
+    const p = nextEvent((e) => e.taskId === ids[3] && e.type === "deleted");
+    const r = await fetch(`http://127.0.0.1:${port}/api/tasks/${ids[3]}`, { method: "DELETE" });
+    assert.equal(r.status, 200);
+    await p;
+    assert.equal(await store.getTask(ids[3]), undefined);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+
+  // MCP: archive + task_list limit/offset + default open-only
+  const client = new Client({ name: "t", version: "0" });
+  await client.connect(new StdioClientTransport({
+    command: process.execPath,
+    args: [join(process.cwd(), "dist/cli/commands.js"), "mcp"],
+    env: { ...process.env, HOME: home },
+  }));
+  try {
+    const up = await client.callTool({ name: "task_update", arguments: { id: ids[1], status: "archive" } });
+    assert.ok(!up.isError, up.content[0].text);
+    assert.equal((await store.getTask(ids[1])).status, "archive");
+    const all = (await client.callTool({ name: "task_list", arguments: {} })).content[0].text;
+    assert.ok(!all.includes(ids[1]), "archived task must not be in default task_list");
+    assert.ok(all.includes(ids[0]));
+    const lim = (await client.callTool({ name: "task_list", arguments: { limit: 1 } })).content[0].text;
+    assert.equal((lim.match(/^\[[a-z-]+\] /gm) ?? []).length, 1);
+  } finally {
+    await client.close();
+  }
+});
