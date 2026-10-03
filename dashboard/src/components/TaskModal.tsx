@@ -108,6 +108,7 @@ export function TaskModal({ task, onClose }: TaskModalProps) {
                   const match = note.match(/^\[(.+?)\]\s*(.+)$/);
                   const timestamp = match ? match[1] : '';
                   const content = match ? match[2] : note;
+                  const meta = task.noteMeta?.[index] ?? null;
 
                   return (
                     <div
@@ -117,9 +118,17 @@ export function TaskModal({ task, onClose }: TaskModalProps) {
                       <span className="text-[11px] text-[var(--text-subtle)] font-mono shrink-0 pt-0.5">
                         {timestamp}
                       </span>
-                      <span className="text-sm text-[var(--text-secondary)] leading-relaxed">
+                      <span className="text-sm text-[var(--text-secondary)] leading-relaxed flex-1 min-w-0">
                         {content}
                       </span>
+                      {(meta?.model || meta?.agent) && (
+                        <span
+                          className="text-[10px] text-[var(--text-subtle)] opacity-60 font-mono shrink-0 pt-0.5 text-right"
+                          title={[meta?.agent && `agent: ${meta.agent}`, meta?.model && `model: ${meta.model}`].filter(Boolean).join('\n')}
+                        >
+                          {[meta?.model, meta?.agent && `(${meta.agent})`].filter(Boolean).join(' ')}
+                        </span>
+                      )}
                     </div>
                   );
                 })}

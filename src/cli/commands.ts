@@ -15,6 +15,7 @@ import {
   deleteTask,
   getTask,
   appendNote,
+  sanitizeNoteMeta,
   recallTasks,
   getAllData,
   listAllSessions,
@@ -232,9 +233,13 @@ program
 program
   .command("note <id> <text>")
   .description("Append a note to a task")
-  .action(async (id, text) => {
+  .option("--model <model>", "Attribute note to a model")
+  .option("--agent <agent>", "Attribute note to an agent")
+  .action(async (id, text, opts) => {
     await initStorage();
-    const task = await appendNote(id, text);
+    const { meta, warnings } = sanitizeNoteMeta(opts);
+    for (const w of warnings) console.error(`Warning: ${w}`);
+    const task = await appendNote(id, text, undefined, meta);
     if (task) {
       const noteCount = task.notes?.length ?? 0;
       console.log(`Note appended to: ${task.title}`);

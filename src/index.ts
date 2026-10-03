@@ -13,6 +13,7 @@ export {
   detectLatestSession,
   getActiveSession,
   appendNote,
+  sanitizeNoteMeta,
   recallTasks,
 } from './storage/store.js';
 
@@ -24,6 +25,7 @@ export type {
   TaskStatus,
   TaskFlowData,
   SessionInfo,
+  NoteMeta,
 } from './types.js';
 
 export { VALID_STATUSES, STATUS_LABELS, STATUS_COLORS } from './types.js';

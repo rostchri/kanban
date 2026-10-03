@@ -17,6 +17,7 @@
     "build": "npm run build:dashboard && npm run build:server",
     "build:dashboard": "cd dashboard && tsc -b && vite build",
     "build:server": "tsc -p tsconfig.server.json",
+    "test": "npm run build:server && node --test test/",
     "dev": "cd dashboard && vite",
     "dev:dashboard": "cd dashboard && vite",
     "check": "tsc -p tsconfig.server.json --noEmit && cd dashboard && tsc -b --noEmit",

@@ -2,7 +2,53 @@ import { promises as fs, existsSync, mkdirSync } from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "child_process";
-import type { Task, TaskFlowData, TaskStatus, SessionInfo } from "../types.js";
+import type {
+  Task,
+  TaskFlowData,
+  TaskStatus,
+  SessionInfo,
+  NoteMeta,
+} from "../types.js";
+
+export const NOTE_META_MAX_LENGTH = 120;
+const NOTE_META_PATTERN = /^[A-Za-z0-9_.:\[\]/@+-]+$/;
+
+export interface SanitizedNoteMeta {
+  meta: NoteMeta | null;
+  /** Human-readable reasons for fields that were dropped */
+  warnings: string[];
+}
+
+/**
+ * Validate optional note attribution. Invalid fields are DROPPED (not
+ * rejected) so that a note is never lost because of a bad attribution
+ * string; the caller gets warnings to surface to the client.
+ */
+export function sanitizeNoteMeta(input?: {
+  model?: unknown;
+  agent?: unknown;
+}): SanitizedNoteMeta {
+  const warnings: string[] = [];
+  const meta: NoteMeta = {};
+  for (const key of ["model", "agent"] as const) {
+    const raw = input?.[key];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== "string") {
+      warnings.push(`${key} ignored: must be a string`);
+      continue;
+    }
+    const value = raw.trim();
+    if (value === "") continue;
+    if (value.length > NOTE_META_MAX_LENGTH) {
+      warnings.push(`${key} ignored: longer than ${NOTE_META_MAX_LENGTH} chars`);
+    } else if (!NOTE_META_PATTERN.test(value)) {
+      warnings.push(`${key} ignored: contains characters outside [A-Za-z0-9_.:[]/@+-]`);
+    } else {
+      meta[key] = value;
+    }
+  }
+  return { meta: meta.model || meta.agent ? meta : null, warnings };
+}
 
 const KANBAN_DIR = path.join(os.homedir(), ".kanban");
 const SESSIONS_DIR = path.join(KANBAN_DIR, "sessions");
@@ -599,6 +645,7 @@ export async function appendNote(
   id: string,
   note: string,
   sessionName?: string,
+  meta?: NoteMeta | null,
 ): Promise<Task | undefined> {
   const targetSession = sessionName ?? (await getCurrentSessionName());
   const data = await readSessionData(targetSession);
@@ -610,7 +657,14 @@ export async function appendNote(
     task.notes = [];
   }
   const timestamp = new Date().toISOString();
+  // Keep noteMeta index-aligned with notes (legacy notes -> null).
+  const prevMeta = task.noteMeta ?? [];
+  const aligned: (NoteMeta | null)[] = task.notes.map((_, i) => prevMeta[i] ?? null);
   task.notes.push(`[${timestamp}] ${note}`);
+  if (meta || prevMeta.length > 0) {
+    aligned.push(meta ?? null);
+    task.noteMeta = aligned;
+  }
   task.updatedAt = timestamp;
 
   await writeSessionData(targetSession, data);
