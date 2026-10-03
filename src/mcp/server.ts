@@ -20,6 +20,7 @@ import {
   moveTask,
   deleteTask,
   appendNote,
+  sanitizeNoteMeta,
   recallTasks,
   listAllSessions,
   getCurrentSessionName,
@@ -417,6 +418,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Note text to append (required)",
             },
+            model: {
+              type: "string",
+              maxLength: 120,
+              description:
+                "Optional: model that wrote the note, e.g. anthropic/claude-sonnet-5-5 (max 120 chars, charset [A-Za-z0-9_.:[]/@+-]; invalid values are dropped with a warning)",
+            },
+            agent: {
+              type: "string",
+              maxLength: 120,
+              description:
+                "Optional: agent that wrote the note, e.g. main or a subagent type (same constraints as model)",
+            },
           },
           required: ["id", "note"],
         },
@@ -732,7 +745,16 @@ server.setRequestHandler(
               isError: true,
             };
           }
-          const task = await appendNote(String(args.id), String(args.note));
+          const { meta, warnings } = sanitizeNoteMeta({
+            model: args.model,
+            agent: args.agent,
+          });
+          const task = await appendNote(
+            String(args.id),
+            String(args.note),
+            undefined,
+            meta,
+          );
           if (!task) {
             return {
               content: [{ type: "text", text: `Error: Task ${args.id} not found.` }],
@@ -744,7 +766,7 @@ server.setRequestHandler(
             content: [
               {
                 type: "text",
-                text: `Appended note to "${task.title}" (${task.id})\nTotal notes: ${noteCount}`,
+                text: `Appended note to "${task.title}" (${task.id})\nTotal notes: ${noteCount}${warnings.length ? `\nWarning: ${warnings.join("; ")}` : ""}`,
               },
             ],
           };
@@ -804,8 +826,17 @@ server.setRequestHandler(
               isError: true,
             };
           }
+          // Note lines stay unchanged (parsers rely on "[ts] text"); attribution
+          // is listed in a separate block, only if any note carries it.
+          const attribution = (task.noteMeta ?? [])
+            .map((m, i) =>
+              m
+                ? `  #${i + 1}${m.model ? ` model=${m.model}` : ""}${m.agent ? ` agent=${m.agent}` : ""}`
+                : null,
+            )
+            .filter((l): l is string => l !== null);
           const notesText = task.notes?.length
-            ? `\nNotes (${task.notes.length}):\n${task.notes.join("\n")}`
+            ? `\nNotes (${task.notes.length}):\n${task.notes.join("\n")}${attribution.length ? `\nNote attribution (1-based index):\n${attribution.join("\n")}` : ""}`
             : "";
           return {
             content: [
