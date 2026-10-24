@@ -22,29 +22,41 @@ export interface SanitizedNoteMeta {
 }
 
 /**
+ * Single canonical validation rule for one attribution field (model, agent,
+ * agentId): trim, max NOTE_META_MAX_LENGTH chars, charset
+ * [A-Za-z0-9_.:[]/@+-]. Invalid values are DROPPED with a human-readable
+ * warning — never a hard error. Absent (undefined/null) and empty-after-trim
+ * values yield neither a value nor a warning.
+ */
+function sanitizeField(
+  key: string,
+  raw: unknown,
+): { value?: string; warning?: string } {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== "string") {
+    return { warning: `${key} ignored: must be a string` };
+  }
+  const value = raw.trim();
+  if (value === "") return {};
+  if (value.length > NOTE_META_MAX_LENGTH) {
+    return { warning: `${key} ignored: longer than ${NOTE_META_MAX_LENGTH} chars` };
+  }
+  if (!NOTE_META_PATTERN.test(value)) {
+    return { warning: `${key} ignored: contains characters outside [A-Za-z0-9_.:[]/@+-]` };
+  }
+  return { value };
+}
+
+/**
  * Validate a single canonical agent-id string (used for noteMeta.agentId and
- * Task.createdBy.agentId). Same rules as sanitizeNoteMeta fields: max
- * NOTE_META_MAX_LENGTH chars, charset [A-Za-z0-9_.:[]/@+-]. Invalid values
- * are DROPPED with a warning — never a hard error.
+ * Task.createdBy.agentId). Same rules as sanitizeNoteMeta fields (see
+ * sanitizeField). Invalid values are DROPPED with a warning.
  */
 export function sanitizeAgentId(
   raw: unknown,
 ): { agentId: string | null; warnings: string[] } {
-  const warnings: string[] = [];
-  if (raw === undefined || raw === null) return { agentId: null, warnings };
-  if (typeof raw !== "string") {
-    return { agentId: null, warnings: ["agentId ignored: must be a string"] };
-  }
-  const value = raw.trim();
-  if (value === "") return { agentId: null, warnings };
-  if (value.length > NOTE_META_MAX_LENGTH) {
-    warnings.push(`agentId ignored: longer than ${NOTE_META_MAX_LENGTH} chars`);
-  } else if (!NOTE_META_PATTERN.test(value)) {
-    warnings.push("agentId ignored: contains characters outside [A-Za-z0-9_.:[]/@+-]");
-  } else {
-    return { agentId: value, warnings };
-  }
-  return { agentId: null, warnings };
+  const { value, warning } = sanitizeField("agentId", raw);
+  return { agentId: value ?? null, warnings: warning ? [warning] : [] };
 }
 
 /**
@@ -60,21 +72,9 @@ export function sanitizeNoteMeta(input?: {
   const warnings: string[] = [];
   const meta: NoteMeta = {};
   for (const key of ["model", "agent", "agentId"] as const) {
-    const raw = input?.[key];
-    if (raw === undefined || raw === null) continue;
-    if (typeof raw !== "string") {
-      warnings.push(`${key} ignored: must be a string`);
-      continue;
-    }
-    const value = raw.trim();
-    if (value === "") continue;
-    if (value.length > NOTE_META_MAX_LENGTH) {
-      warnings.push(`${key} ignored: longer than ${NOTE_META_MAX_LENGTH} chars`);
-    } else if (!NOTE_META_PATTERN.test(value)) {
-      warnings.push(`${key} ignored: contains characters outside [A-Za-z0-9_.:[]/@+-]`);
-    } else {
-      meta[key] = value;
-    }
+    const { value, warning } = sanitizeField(key, input?.[key]);
+    if (warning) warnings.push(warning);
+    else if (value !== undefined) meta[key] = value;
   }
   return {
     meta: meta.model || meta.agent || meta.agentId ? meta : null,
