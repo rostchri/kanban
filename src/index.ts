@@ -14,6 +14,7 @@ export {
   getActiveSession,
   appendNote,
   sanitizeNoteMeta,
+  sanitizeAgentId,
   recallTasks,
 } from './storage/store.js';
 
@@ -22,6 +23,7 @@ export { createDashboardServer, startDashboardServer } from './server/http.js';
 
 export type {
   Task,
+  TaskCreatedBy,
   TaskStatus,
   TaskFlowData,
   SessionInfo,

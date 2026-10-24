@@ -21,6 +21,7 @@ import {
   deleteTask,
   appendNote,
   sanitizeNoteMeta,
+  sanitizeAgentId,
   recallTasks,
   listAllSessions,
   getCurrentSessionName,
@@ -308,6 +309,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 "Optional tags for categorization. Pass as a JSON array, e.g. [\"bug\", \"host:srv01\"]. " +
                 "Do NOT embed tags inside the description field — use this parameter.",
             },
+            createdBy_agent_id: {
+              type: "string",
+              maxLength: 120,
+              description:
+                "Optional: canonical agent identity that creates this task (max 120 chars, charset [A-Za-z0-9_.:[]/@+-]; invalid values are dropped with a warning). Stored once at creation, never modified by updates.",
+            },
           },
           required: ["title"],
         },
@@ -430,6 +437,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Optional: agent that wrote the note, e.g. main or a subagent type (same constraints as model)",
             },
+            agentId: {
+              type: "string",
+              maxLength: 120,
+              description:
+                "Optional: canonical agent identity that wrote the note (same constraints as model/agent; invalid values are dropped with a warning)",
+            },
           },
           required: ["id", "note"],
         },
@@ -519,12 +532,18 @@ server.setRequestHandler(
             ? requireValidStatus(args.status)
             : "todo";
 
+          // Creator attribution: dropped with a warning if invalid, never
+          // an error; set once here — task_update cannot touch it.
+          const { agentId: createdByAgentId, warnings: createdByWarnings } =
+            sanitizeAgentId(args.createdBy_agent_id);
+
           const task = await createTask({
             title: String(args.title).trim(),
             description,
             status,
             tags,
             source: CURRENT_AGENT,
+            createdBy: createdByAgentId ? { agentId: createdByAgentId } : undefined,
           });
           const sessionName = await getCurrentSessionName();
 
@@ -537,7 +556,7 @@ server.setRequestHandler(
               {
                 type: "text",
                 text:
-                  `Created task "${task.title}" in session "${sessionName}".${recoveryNote}\n` +
+                  `Created task "${task.title}" in session "${sessionName}".${recoveryNote}${createdByWarnings.length ? `\nWarning: ${createdByWarnings.join("; ")}` : ""}\n` +
                   `VERIFY: id=${task.id} | status=${task.status} | tags=${JSON.stringify(task.tags)}`,
               },
             ],
@@ -748,6 +767,7 @@ server.setRequestHandler(
           const { meta, warnings } = sanitizeNoteMeta({
             model: args.model,
             agent: args.agent,
+            agentId: args.agentId,
           });
           const task = await appendNote(
             String(args.id),

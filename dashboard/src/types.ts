@@ -9,12 +9,29 @@ export interface NoteMeta {
   model?: string;
   /** Agent, e.g. "main" or a subagent type like "my-svelte-developer" */
   agent?: string;
+  /**
+   * Canonical chatroom agent identity that wrote the note (e.g.
+   * "agent-abc123"), set by the client hook. Same sanitize rules as
+   * model/agent (max 120 chars, charset [A-Za-z0-9_.:[]/@+-]).
+   */
+  agentId?: string;
+}
+
+/**
+ * Deterministic creator attribution, set once at task creation and never
+ * modified afterwards (task_update must not touch it).
+ */
+export interface TaskCreatedBy {
+  /** Canonical chatroom agent identity (max 120 chars, charset [A-Za-z0-9_.:[]/@+-]). */
+  agentId: string;
 }
 
 export interface Task {
   id: string;
   title: string;
   description?: string;
+  /** Who created this task (absent for legacy tasks; never backdated). */
+  createdBy?: TaskCreatedBy;
   notes?: string[];
   /**
    * Optional per-note attribution, index-aligned with `notes`

@@ -5,6 +5,7 @@ import { execSync } from "child_process";
 import { EventEmitter } from "events";
 import type {
   Task,
+  TaskCreatedBy,
   TaskFlowData,
   TaskStatus,
   SessionInfo,
@@ -21,6 +22,32 @@ export interface SanitizedNoteMeta {
 }
 
 /**
+ * Validate a single canonical agent-id string (used for noteMeta.agentId and
+ * Task.createdBy.agentId). Same rules as sanitizeNoteMeta fields: max
+ * NOTE_META_MAX_LENGTH chars, charset [A-Za-z0-9_.:[]/@+-]. Invalid values
+ * are DROPPED with a warning — never a hard error.
+ */
+export function sanitizeAgentId(
+  raw: unknown,
+): { agentId: string | null; warnings: string[] } {
+  const warnings: string[] = [];
+  if (raw === undefined || raw === null) return { agentId: null, warnings };
+  if (typeof raw !== "string") {
+    return { agentId: null, warnings: ["agentId ignored: must be a string"] };
+  }
+  const value = raw.trim();
+  if (value === "") return { agentId: null, warnings };
+  if (value.length > NOTE_META_MAX_LENGTH) {
+    warnings.push(`agentId ignored: longer than ${NOTE_META_MAX_LENGTH} chars`);
+  } else if (!NOTE_META_PATTERN.test(value)) {
+    warnings.push("agentId ignored: contains characters outside [A-Za-z0-9_.:[]/@+-]");
+  } else {
+    return { agentId: value, warnings };
+  }
+  return { agentId: null, warnings };
+}
+
+/**
  * Validate optional note attribution. Invalid fields are DROPPED (not
  * rejected) so that a note is never lost because of a bad attribution
  * string; the caller gets warnings to surface to the client.
@@ -28,10 +55,11 @@ export interface SanitizedNoteMeta {
 export function sanitizeNoteMeta(input?: {
   model?: unknown;
   agent?: unknown;
+  agentId?: unknown;
 }): SanitizedNoteMeta {
   const warnings: string[] = [];
   const meta: NoteMeta = {};
-  for (const key of ["model", "agent"] as const) {
+  for (const key of ["model", "agent", "agentId"] as const) {
     const raw = input?.[key];
     if (raw === undefined || raw === null) continue;
     if (typeof raw !== "string") {
@@ -48,7 +76,10 @@ export function sanitizeNoteMeta(input?: {
       meta[key] = value;
     }
   }
-  return { meta: meta.model || meta.agent ? meta : null, warnings };
+  return {
+    meta: meta.model || meta.agent || meta.agentId ? meta : null,
+    warnings,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +643,11 @@ export async function createTask(
     status?: TaskStatus;
     tags?: string[];
     source?: "claude" | "opencode" | "manual";
+    /**
+     * Creator attribution, set ONCE at creation. Already-sanitized value
+     * (see sanitizeAgentId); absent -> no createdBy field.
+     */
+    createdBy?: TaskCreatedBy;
   },
   sessionName?: string,
 ): Promise<Task> {
@@ -628,6 +664,7 @@ export async function createTask(
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+  if (input.createdBy?.agentId) task.createdBy = { agentId: input.createdBy.agentId };
 
   data.tasks.push(task);
   await writeSessionData(targetSession, data);
@@ -659,6 +696,7 @@ export async function updateTask(
   if (input.description !== undefined) task.description = input.description;
   if (input.status !== undefined) task.status = input.status;
   if (input.tags !== undefined) task.tags = input.tags;
+  // createdBy is creation-time-only: updateTask never modifies it.
   task.updatedAt = new Date().toISOString();
 
   await writeSessionData(targetSession, data);
